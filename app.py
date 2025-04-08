@@ -12,6 +12,7 @@ from slam3r.datasets.wild_seq import Seq_Data
 from slam3r.models import Local2WorldModel, Image2PointsModel
 from slam3r.utils.device import to_numpy
 from slam3r.utils.recon_utils import *
+from pointclassifier.yolo import YOLOPointClassifier
 
 
 def get_args_parser():
@@ -42,18 +43,22 @@ def extract_frames(video_path: str, fps: float) -> str:
     return temp_dir
 
 def recon_scene(i2p_model:Image2PointsModel, 
-                l2w_model:Local2WorldModel, 
+                l2w_model:Local2WorldModel,             
                 device, save_dir, fps, 
                 img_dir_or_list, 
                 keyframe_stride, win_r, initial_winsize, conf_thres_i2p,
                 num_scene_frame, update_buffer_intv, buffer_strategy, buffer_size,
-                conf_thres_l2w, num_points_save):
+                conf_thres_l2w, num_points_save, use_yolo, yolo_weights_path):
     # print(f"device: {device},\n save_dir: {save_dir},\n fps: {fps},\n keyframe_stride: {keyframe_stride},\n win_r: {win_r},\n initial_winsize: {initial_winsize},\n conf_thres_i2p: {conf_thres_i2p},\n num_scene_frame: {num_scene_frame},\n update_buffer_intv: {update_buffer_intv},\n buffer_strategy: {buffer_strategy},\n buffer_size: {buffer_size},\n conf_thres_l2w: {conf_thres_l2w},\n num_points_save: {num_points_save}")
     np.random.seed(42)
     
     # load the imgs or video
     if isinstance(img_dir_or_list, str):
         img_dir_or_list = extract_frames(img_dir_or_list, fps)
+
+    # if chosen to use yolo, load yolo_point_classifier
+    if use_yolo:
+        yolo_point_classifier = YOLOPointClassifier(yolo_weights_path)
     
     dataset = Seq_Data(img_dir_or_list, to_tensor=True)
     data_views = dataset[0][:]
@@ -71,6 +76,12 @@ def recon_scene(i2p_model:Image2PointsModel,
     for view in data_views:
         view['img'] = torch.tensor(view['img'][None])
         view['true_shape'] = torch.tensor(view['true_shape'][None])
+
+        if yolo_point_classifier:
+            yolo_point_classifier.predict_view(view['img'])
+        else:
+            yolo_point_classifier = None
+            
         for key in ['valid_mask', 'pts3d_cam', 'pts3d']:
             if key in view:
                 del view[key]
@@ -329,35 +340,48 @@ def recon_scene(i2p_model:Image2PointsModel,
     save_path = get_model_from_scene(per_frame_res=per_frame_res, 
                                      save_dir=save_dir, 
                                      num_points_save=num_points_save, 
-                                     conf_thres_res=conf_thres_l2w)
+                                     conf_thres_res=conf_thres_l2w,
+                                     yolo_point_classifier=yolo_point_classifier)
 
     return save_path, per_frame_res
     
     
-def get_model_from_scene(per_frame_res, save_dir, 
-                         num_points_save=200000, 
+def get_model_from_scene(per_frame_res, save_dir,
+                         yolo_point_classifier,
+                         num_points_save=200000,
                          conf_thres_res=3, 
                          valid_masks=None
-                        ):  
+                         ):  
         
     # collect the registered point clouds and rgb colors
     pcds = []
     rgbs = []
+    classes = []
     pred_frame_num = len(per_frame_res['l2w_pcds'])
     registered_confs = per_frame_res['l2w_confs']   
     registered_pcds = per_frame_res['l2w_pcds']
     rgb_imgs = per_frame_res['rgb_imgs']
+
+    print(f"pred_frame_num size: {len(per_frame_res['l2w_pcds'])}")
+
+
     for i in range(pred_frame_num):
         registered_pcd = to_numpy(registered_pcds[i])
         if registered_pcd.shape[0] == 3:
             registered_pcd = registered_pcd.transpose(1,2,0)
         registered_pcd = registered_pcd.reshape(-1,3)
         rgb = rgb_imgs[i].reshape(-1,3)
+        if yolo_point_classifier is not None:
+            point_classes = yolo_point_classifier.classify_points(registered_pcd)
+        else:
+            point_classes = np.zeros((registered_pcd.shape[0],), dtype=int)
         pcds.append(registered_pcd)
         rgbs.append(rgb)
+        classes.append(point_classes)
         
     res_pcds = np.concatenate(pcds, axis=0)
     res_rgbs = np.concatenate(rgbs, axis=0)
+    res_classes = np.concatenate(classes, axis=0)
     
     pts_count = len(res_pcds)
     valid_ids = np.arange(pts_count)
@@ -386,14 +410,30 @@ def get_model_from_scene(per_frame_res, save_dir,
     sampled_idx = np.random.choice(valid_ids, n_samples, replace=False)
     sampled_pts = res_pcds[sampled_idx]
     sampled_rgbs = res_rgbs[sampled_idx]
+    sampled_classes = res_classes[sampled_idx]
+
+    print("Unique classes in the sampled points:", np.unique(sampled_classes))
     
     sampled_pts[:, :2] *= -1 # flip the x,y axis for better visualization
-    
-    save_name = f"recon.glb"
-    scene = trimesh.Scene()
-    scene.add_geometry(trimesh.PointCloud(vertices=sampled_pts, colors=sampled_rgbs/255.))
-    save_path = join(save_dir, save_name)
-    scene.export(save_path)
+
+    # save as .pcd to store class if yolo is used
+    if yolo_point_classifier is not None:
+        save_path = join(save_dir, "recon.pcd")
+        with open(save_path, 'w') as f:
+            f.write("""# .PCD v0.7 - Point Cloud Data file format
+VERSION 0.7
+FIELDS x y z class
+SIZE 4 4 4 4
+TYPE F F F I
+COUNT 1 1 1 1
+WIDTH {}\nHEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\nPOINTS {}\nDATA ascii\n""".format(n_samples, n_samples))
+            for p, c in zip(sampled_pts, sampled_classes):
+                f.write(f"{p[0]} {p[1]} {p[2]} {c}\n")
+    else:
+        scene = trimesh.Scene()
+        scene.add_geometry(trimesh.PointCloud(vertices=sampled_pts, colors=sampled_rgbs/255.))
+        save_path = join(save_dir, "recon.glb")
+        scene.export(save_path)
 
     return save_path
 
@@ -460,15 +500,18 @@ def change_buffer_strategy(buffer_strategy):
                                     info="For L2W reconstruction!")
     return buffer_size
 
+#TODO: implementar viewer para os resultados que usam yolo como pointclassifier (viewer para .pcd)
 def main_demo(i2p_model, l2w_model, device, tmpdirname, server_name, server_port):
     recon_scene_func = functools.partial(recon_scene, i2p_model, l2w_model, device)
+
     with gradio.Blocks(css=""".gradio-container {margin: 0 !important; min-width: 100%};""", title="SLAM3R Demo") as demo:
         # scene state is save so that you can change num_points_save... without rerunning the inference
         per_frame_res = gradio.State(None)
-        tmpdir_name = gradio.State(tmpdirname)
+        tmpdir_name = gradio.State(tmpdirname)  
+        yolo_weights_path = gradio.State(None)
         
         gradio.HTML('<h2 style="text-align: center;">SLAM3R Demo</h2>')
-        with gradio.Column():
+        with gradio.Column():       
             with gradio.Row():
                 input_type = gradio.Dropdown([ "directory", "images", "video"],
                                              scale=1,
@@ -483,6 +526,34 @@ def main_demo(i2p_model, l2w_model, device, tmpdirname, server_name, server_port
                                          height=200,
                                          label="Select a directory containing images")
                 
+                
+            with gradio.Row():
+                use_yolo = gradio.Checkbox(label="Use YOLO for points classification",
+                                           value=False,
+                                           scale=1)
+                yolo_weights = gradio.File(visible=False,
+                                           file_types=[".pt", ".weights"],
+                                           file_count="single",
+                                           scale=2,
+                                           height=200,
+                                           interactive = True,
+                                           label="Upload YOLO weights")
+
+            use_yolo.change(
+                fn=lambda use, weights: (
+                    gradio.update(visible=use),
+                    YOLOPointClassifier(weights.name) if use and weights is not None else None
+                ),
+                inputs=[use_yolo, yolo_weights],
+                outputs=[yolo_weights, yolo_weights_path]
+            )
+
+            yolo_weights.change(
+                fn=lambda file: file.name if file is not None else None,
+                inputs=[yolo_weights],
+                outputs=[yolo_weights_path]
+            )
+
             with gradio.Row():
                 kf_stride = gradio.Dropdown(["auto", "manual setting"], label="how to choose stride between keyframes",
                                            value='auto', interactive=True,  
@@ -553,7 +624,7 @@ def main_demo(i2p_model, l2w_model, device, tmpdirname, server_name, server_port
                           inputs=[tmpdir_name, video_extract_fps,
                                   inputfiles, kf_stride_fix, win_r, initial_winsize, conf_thres_i2p,
                                   num_scene_frame, update_buffer_intv, buffer_strategy, buffer_size,
-                                  conf_thres_l2w, num_points_save],
+                                  conf_thres_l2w, num_points_save, use_yolo, yolo_weights_path],
                           outputs=[outmodel, per_frame_res])
             conf_thres_l2w.release(fn=get_model_from_scene,
                                  inputs=[per_frame_res, tmpdir_name, num_points_save, conf_thres_l2w],
